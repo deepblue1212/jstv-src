@@ -1,0 +1,5 @@
+env:
+  UPSTREAM: "https://9280.kstore.vip/cat/index.js"
+  KEEP: "豆瓣|首页"          # 精确匹配的源名，逗号分隔
+  KEEP_CONTAINS: "秒播"       # 包含该词就保留，逗号分隔
+  OUT_DIR: "jstv"
