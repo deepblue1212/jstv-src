@@ -1,5 +1,150 @@
+name: Build filtered source
+
+# ================= 改这里就能调整保留哪些源（改完提交即自动重建）=================
 env:
   UPSTREAM: "https://9280.kstore.vip/cat/index.js"
-  KEEP: "豆瓣|首页"          # 精确匹配的源名，逗号分隔
-  KEEP_CONTAINS: "秒播"       # 包含该词就保留，逗号分隔
+  KEEP: "豆瓣|首页"
+  KEEP_CONTAINS: "秒播"
   OUT_DIR: "jstv"
+# ================================================================================
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build.yml'
+  schedule:
+    # 每天 20:00 UTC（北京时间次日 04:00）跟随上游自动重建
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 拉取上游、套用白名单并自检
+        run: |
+          cat > /tmp/build.js <<'JSEOF'
+          'use strict';
+          const fs = require('node:fs');
+          const os = require('node:os');
+          const path = require('node:path');
+          const crypto = require('node:crypto');
+          const { execFileSync } = require('node:child_process');
+
+          const UPSTREAM = process.env.UPSTREAM;
+          const OUT_DIR = process.env.OUT_DIR || 'jstv';
+          const KEEP = (process.env.KEEP || '').split(',').map((s) => s.trim()).filter(Boolean);
+          const KEEP_CONTAINS = (process.env.KEEP_CONTAINS || '').split(',').map((s) => s.trim()).filter(Boolean);
+
+          function esc(s) {
+            return s.replace(/[^\x20-\x7e]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0').toUpperCase());
+          }
+
+          function buildFilter() {
+            const conds = [];
+            for (const k of KEEP) conds.push('n===' + esc(JSON.stringify(k)));
+            for (const c of KEEP_CONTAINS) conds.push('n.indexOf(' + esc(JSON.stringify(c)) + ')>=0');
+            return '.filter(function(t){var n=String(t&&t.meta&&t.meta.name||"");return ' + (conds.join('||') || 'false') + '})';
+          }
+
+          const PROBE = `
+          ;(async()=>{try{
+            const e={config:{pan:{maxLinksPerProvider:10,showTranscode:true,showUcUnlimited:false,priority:[]}},
+              db:{get:async()=>undefined,set:async()=>{},delete:async()=>{}},
+              credentials:{getCredential:async()=>undefined,setCredential:async()=>{}},
+              messageToDart:async()=>{},remoteWexConfig:{}};
+            const n=await zm0(e);
+            console.log("COUNT="+n.length);
+            console.log("LIST="+n.map(x=>x.meta.name).join(" | "));
+          }catch(err){console.error("PROBE_ERR="+(err&&err.message));process.exit(3)}})();
+          `;
+
+          (async () => {
+            console.log('上游: ' + UPSTREAM);
+            const res = await fetch(UPSTREAM, {
+              headers: { 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)' },
+              redirect: 'follow',
+            });
+            if (!res.ok) throw new Error('上游返回 HTTP ' + res.status);
+            const src = await res.text();
+            if (src.length < 100000) throw new Error('上游内容异常，仅 ' + src.length + ' 字节');
+            console.log('上游大小: ' + src.length + ' 字节');
+
+            const re = /function qm0\(e\)\{return\[[\s\S]*?\]\}async function zm0/;
+            const m = src.match(re);
+            if (!m) throw new Error('未找到 qm0 锚点，上游格式可能已变更');
+
+            const head = 'function qm0(e){return';
+            const tail = '}async function zm0';
+            const arr = m[0].slice(head.length, m[0].length - tail.length);
+            const filter = buildFilter();
+            console.log('过滤条件: ' + filter);
+
+            const patched = src.slice(0, m.index) + head + arr + filter + tail + src.slice(m.index + m[0].length);
+
+            fs.mkdirSync(OUT_DIR, { recursive: true });
+            const outFile = path.join(OUT_DIR, 'index.js');
+            fs.writeFileSync(outFile, patched);
+
+            const probeFile = path.join(os.tmpdir(), 'jstv_probe_' + Date.now() + '.js');
+            fs.writeFileSync(probeFile, patched + PROBE);
+            let stdout;
+            try {
+              stdout = execFileSync(process.execPath, [probeFile], {
+                encoding: 'utf8',
+                stdio: ['ignore', 'pipe', 'pipe'],
+                timeout: 180000,
+              });
+            } catch (e) {
+              throw new Error('自检执行失败: ' + (e.stderr || e.message));
+            } finally {
+              try { fs.unlinkSync(probeFile); } catch {}
+            }
+
+            const c = stdout.match(/COUNT=(\d+)/);
+            const l = stdout.match(/LIST=([^\n]*)/);
+            if (!c || !l) throw new Error('自检未取得源清单，输出：' + stdout.slice(0, 500));
+
+            const names = l[1].split(' | ').map((s) => s.trim()).filter(Boolean);
+            if (names.length !== Number(c[1])) throw new Error('自检结果自相矛盾');
+            if (names.length === 0) throw new Error('自检失败：源清单为空');
+            for (const k of KEEP) {
+              if (!names.includes(k)) throw new Error('自检失败：白名单中的「' + k + '」未出现在结果里');
+            }
+
+            console.log('源数量: ' + names.length);
+            for (const n of names) console.log('  - ' + n);
+
+            const md5 = crypto.createHash('md5').update(fs.readFileSync(outFile)).digest('hex');
+            fs.writeFileSync(path.join(OUT_DIR, 'index.js.md5'), md5);
+            fs.writeFileSync(path.join(OUT_DIR, 'SOURCES.txt'), names.join('\n') + '\n');
+            console.log('MD5: ' + md5);
+            console.log('完成');
+          })().catch((e) => {
+            console.error('构建失败: ' + (e && e.message));
+            process.exit(1);
+          });
+          JSEOF
+          node /tmp/build.js
+
+      - name: 提交产物
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$OUT_DIR"
+          if git diff --cached --quiet; then
+            echo "内容无变化，跳过提交"
+          else
+            git commit -m "build: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi
