@@ -3,6 +3,9 @@ name: Build filtered source
 # ================= 改这里就能调整保留哪些源（改完提交即自动重建）=================
 env:
   UPSTREAM: "https://9280.kstore.vip/cat/index.js"
+  # 订阅目录必须四件套齐全：index.js / index.js.md5 / index.config.js / index.config.js.md5
+  # 缺 index.config.js 会被 App 判定为「下载失败」
+  UPSTREAM_CONFIG: "https://9280.kstore.vip/cat/index.config.js"
   KEEP: "豆瓣|首页"
   KEEP_CONTAINS: "秒播"
   OUT_DIR: "jstv"
@@ -41,6 +44,7 @@ jobs:
           const { execFileSync } = require('node:child_process');
 
           const UPSTREAM = process.env.UPSTREAM;
+          const UPSTREAM_CONFIG = process.env.UPSTREAM_CONFIG;
           const OUT_DIR = process.env.OUT_DIR || 'jstv';
           const KEEP = (process.env.KEEP || '').split(',').map((s) => s.trim()).filter(Boolean);
           const KEEP_CONTAINS = (process.env.KEEP_CONTAINS || '').split(',').map((s) => s.trim()).filter(Boolean);
@@ -128,6 +132,23 @@ jobs:
             fs.writeFileSync(path.join(OUT_DIR, 'index.js.md5'), md5);
             fs.writeFileSync(path.join(OUT_DIR, 'SOURCES.txt'), names.join('\n') + '\n');
             console.log('MD5: ' + md5);
+
+            // ---- 配置文件（默认配置模板）：原样搬运，md5 自算以保证成对 ----
+            if (UPSTREAM_CONFIG) {
+              const cres = await fetch(UPSTREAM_CONFIG, {
+                headers: { 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)' },
+                redirect: 'follow',
+              });
+              if (!cres.ok) throw new Error('配置文件上游返回 HTTP ' + cres.status);
+              const cfg = await cres.text();
+              if (cfg.length < 500) throw new Error('配置文件内容异常，仅 ' + cfg.length + ' 字节');
+              const cfgFile = path.join(OUT_DIR, 'index.config.js');
+              fs.writeFileSync(cfgFile, cfg);
+              const cfgMd5 = crypto.createHash('md5').update(fs.readFileSync(cfgFile)).digest('hex');
+              fs.writeFileSync(path.join(OUT_DIR, 'index.config.js.md5'), cfgMd5);
+              console.log('配置文件: ' + cfg.length + ' 字节, MD5: ' + cfgMd5);
+            }
+
             console.log('完成');
           })().catch((e) => {
             console.error('构建失败: ' + (e && e.message));
