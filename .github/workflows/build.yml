@@ -60,44 +60,69 @@ jobs:
             return '.filter(function(t){var n=String(t&&t.meta&&t.meta.name||"");return ' + (conds.join('||') || 'false') + '})';
           }
 
-          const PROBE = `
-          ;(async()=>{try{
-            const e={config:{pan:{maxLinksPerProvider:10,showTranscode:true,showUcUnlimited:false,priority:[]}},
-              db:{get:async()=>undefined,set:async()=>{},delete:async()=>{}},
-              credentials:{getCredential:async()=>undefined,setCredential:async()=>{}},
-              messageToDart:async()=>{},remoteWexConfig:{}};
-            const n=await zm0(e);
-            console.log("COUNT="+n.length);
-            console.log("LIST="+n.map(x=>x.meta.name).join(" | "));
-          }catch(err){console.error("PROBE_ERR="+(err&&err.message));process.exit(3)}})();
-          `;
+          // 只认代码结构，不认压缩后的变量名。上游每次重新压缩都会换掉 qm0/zm0/Um0 这类名字，
+          // 但「X=await Y(Z);e.spiders=X,」这段赋值结构是稳定的。
+          const ANCHOR = /([A-Za-z_$][\w$]*)\s*=\s*await\s+([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\)\s*;\s*(e\.spiders\s*=\s*\1\s*[,;])/;
 
           (async () => {
             console.log('上游: ' + UPSTREAM);
+            console.log('Node ' + process.version);
             const res = await fetch(UPSTREAM, {
               headers: { 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)' },
               redirect: 'follow',
             });
             if (!res.ok) throw new Error('上游返回 HTTP ' + res.status);
             const src = await res.text();
-            if (src.length < 100000) throw new Error('上游内容异常，仅 ' + src.length + ' 字节');
-            console.log('上游大小: ' + src.length + ' 字节');
+            if (src.length < 100000) throw new Error('上游内容异常，仅 ' + src.length + ' 字符');
+            console.log('上游大小: ' + src.length + ' 字符');
 
-            const re = /function qm0\(e\)\{return\[[\s\S]*?\]\}async function zm0/;
-            const m = src.match(re);
-            if (!m) throw new Error('未找到 qm0 锚点，上游格式可能已变更');
+            const hit = src.match(ANCHOR);
+            if (!hit) {
+              throw new Error('未找到源注册锚点（形如 X=await Y(Z);e.spiders=X,）。上游结构可能已变更，需人工核对后再改脚本。');
+            }
 
-            const head = 'function qm0(e){return';
-            const tail = '}async function zm0';
-            const arr = m[0].slice(head.length, m[0].length - tail.length);
+            const anchorIdx = src.search(ANCHOR);
+            const arrVar = hit[1];
+            const wrapper = hit[2];
+            const argVar = hit[3];
+            const tail = hit[4];
+
+            // 锚点所在的外层函数（真正给 e.spiders 赋值、并据此注册路由的那个）
+            const decls = [...src.slice(0, anchorIdx).matchAll(/(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/g)];
+            if (!decls.length) throw new Error('无法定位锚点所在的外层函数');
+            const setupFn = decls[decls.length - 1][1];
+
             const filter = buildFilter();
+            console.log('锚点命中: ' + hit[0]);
+            console.log('源注册函数: ' + wrapper + '（压缩后的名字，脚本不依赖）');
+            console.log('外层函数: ' + setupFn + '（压缩后的名字，脚本不依赖）');
             console.log('过滤条件: ' + filter);
 
-            const patched = src.slice(0, m.index) + head + arr + filter + tail + src.slice(m.index + m[0].length);
+            const repl = arrVar + '=(await ' + wrapper + '(' + argVar + '))' + filter + ';' + tail;
+            const patched = src.replace(ANCHOR, () => repl);
+            if (patched === src) throw new Error('补丁未生效（替换后内容无变化）');
 
             fs.mkdirSync(OUT_DIR, { recursive: true });
             const outFile = path.join(OUT_DIR, 'index.js');
             fs.writeFileSync(outFile, patched);
+
+            // 自检：把产物真实执行一遍。e.spiders 是外层函数早期就赋值的，
+            // 所以后续步骤（注册路由、写 db）即使抛错也不影响取结果。
+            const PROBE =
+              '\n;(async()=>{try{\n' +
+              '  const e={config:{pan:{maxLinksPerProvider:10,showTranscode:true,showUcUnlimited:false,priority:[]}},\n' +
+              '    credentials:{getCredential:async()=>undefined,setCredential:async()=>{}},\n' +
+              '    db:{get:async()=>undefined,set:async()=>{},delete:async()=>{}},\n' +
+              '    messageToDart:async()=>{},remoteWexConfig:{}};\n' +
+              '  e.decorate=function(k,v){e[k]=v};\n' +
+              '  e.register=async function(){};\n' +
+              '  e.get=async function(){};e.post=async function(){};e.put=async function(){};e.delete=async function(){};\n' +
+              '  try{ await ' + setupFn + '(e) }catch(_e){}\n' +
+              '  const n=e.spiders;\n' +
+              '  if(!Array.isArray(n)) throw new Error("未能取得源列表");\n' +
+              '  console.log("COUNT="+n.length);\n' +
+              '  console.log("LIST="+n.map(x=>String(x&&x.meta&&x.meta.name||"")).join(" | "));\n' +
+              '}catch(err){console.error("PROBE_ERR="+(err&&err.message));process.exit(3)}})();\n';
 
             const probeFile = path.join(os.tmpdir(), 'jstv_probe_' + Date.now() + '.js');
             fs.writeFileSync(probeFile, patched + PROBE);
@@ -107,6 +132,8 @@ jobs:
                 encoding: 'utf8',
                 stdio: ['ignore', 'pipe', 'pipe'],
                 timeout: 180000,
+                // 万一上游的自启动守卫变了，也强制禁掉，避免探针把服务跑起来卡死
+                env: Object.assign({}, process.env, { CATVOD_DISABLE_AUTOSTART: '1' }),
               });
             } catch (e) {
               throw new Error('自检执行失败: ' + (e.stderr || e.message));
@@ -121,8 +148,19 @@ jobs:
             const names = l[1].split(' | ').map((s) => s.trim()).filter(Boolean);
             if (names.length !== Number(c[1])) throw new Error('自检结果自相矛盾');
             if (names.length === 0) throw new Error('自检失败：源清单为空');
+            if (names.length > 200) throw new Error('自检失败：源数量 ' + names.length + ' 明显异常，补丁可能未生效');
+
+            // 严格断言：结果里不能出现任何白名单之外的源
+            // （只检查「白名单项是否存在」抓不到补丁未生效的情况）
+            for (const n of names) {
+              const allowed = KEEP.includes(n) || KEEP_CONTAINS.some((k) => n.includes(k));
+              if (!allowed) throw new Error('自检失败：结果里混入了白名单之外的源「' + n + '」，补丁未生效');
+            }
             for (const k of KEEP) {
               if (!names.includes(k)) throw new Error('自检失败：白名单中的「' + k + '」未出现在结果里');
+            }
+            for (const k of KEEP_CONTAINS) {
+              if (!names.some((n) => n.includes(k))) throw new Error('自检失败：白名单关键词「' + k + '」一个源都没匹配到');
             }
 
             console.log('源数量: ' + names.length);
@@ -141,12 +179,12 @@ jobs:
               });
               if (!cres.ok) throw new Error('配置文件上游返回 HTTP ' + cres.status);
               const cfg = await cres.text();
-              if (cfg.length < 500) throw new Error('配置文件内容异常，仅 ' + cfg.length + ' 字节');
+              if (cfg.length < 500) throw new Error('配置文件内容异常，仅 ' + cfg.length + ' 字符');
               const cfgFile = path.join(OUT_DIR, 'index.config.js');
               fs.writeFileSync(cfgFile, cfg);
               const cfgMd5 = crypto.createHash('md5').update(fs.readFileSync(cfgFile)).digest('hex');
               fs.writeFileSync(path.join(OUT_DIR, 'index.config.js.md5'), cfgMd5);
-              console.log('配置文件: ' + cfg.length + ' 字节, MD5: ' + cfgMd5);
+              console.log('配置文件: ' + cfg.length + ' 字符, MD5: ' + cfgMd5);
             }
 
             console.log('完成');
